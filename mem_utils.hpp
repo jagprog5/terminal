@@ -20,3 +20,10 @@ struct scope_exit {
 
 template <class F>
 scope_exit(F) -> scope_exit<F>;
+
+
+struct destroyer_for_malloc {
+  void operator()(void* p) { free(p); } // explicitely no null check
+};
+
+using UniqMalloc = std::unique_ptr<void, destroyer_for_malloc>;

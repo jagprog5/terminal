@@ -14,6 +14,7 @@
 #include <cwchar>
 #include <deque>
 #include <optional>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -23,11 +24,10 @@
 
 #include "sdl_utils.hpp"
 
-
 static const char* SHELL = "/bin/dash";
 
 #define TERM_NAME "not_named_yet"
-#define GENERAL_TIMEOUT_MS 30
+#define GENERAL_TIMEOUT_MS 20
 
 // raii wrapper of file descriptor
 class FileDescriptor {
@@ -201,21 +201,36 @@ class PTY {
     // from the read/write implementation on the os
     std::mutex master_lock;
 
-    std::thread reader_thread([&quit, &master_lock, &master = this->master, read_event_type]() {
+    // data is read from the pts in the reader thread. it gets sent to the main
+    // thread via custom SDL_Event. During transit, the application could
+    // shutdown, meaning the events are dropped from the queue without the data
+    // being freed. this ensures there is a hold at all times.
+    std::unordered_set<UniqMalloc> reader_outbound_data;
+    std::mutex reader_outbound_data_lock;
+
+    std::thread reader_thread([&quit,                       //
+                               &master_lock,                //
+                                   & master = this->master, //
+                               read_event_type,             //
+                               &reader_outbound_data,       //
+                               &reader_outbound_data_lock]() {
+      // if quit is set to true by main thread, reader is guarenteed to exit in bounded time
       while (!quit) {
         static constexpr size_t BUF_MAX_SIZE = 256;
-        void* buffer = malloc(sizeof(char) * BUF_MAX_SIZE);
+        auto buffer = UniqMalloc(malloc(sizeof(char) * BUF_MAX_SIZE));
         if (buffer == NULL) {
-          perror("malloc buf");
           quit = true; // signal to main thread
+          perror("malloc buf");
           break;
         }
 
         ssize_t size;
+read_again:
+        (void)0; // formatter
         {
-          std::lock_guard lk(master_lock);
+          std::lock_guard(master_lock);
           // note that master was set to non-blocking mode
-          size = read(master, buffer, BUF_MAX_SIZE);
+          size = read(master, buffer.get(), BUF_MAX_SIZE);
         }
 
         if (size == -1) {
@@ -223,67 +238,112 @@ class PTY {
           if (errno == EAGAIN || errno == EWOULDBLOCK) {
             // no input yet. delay to not spinlock
             std::this_thread::sleep_for(std::chrono::milliseconds(GENERAL_TIMEOUT_MS));
-            continue;
+            goto read_again;
           } else {
-            perror("read pts");
             quit = true; // signal to main thread
+            perror("read pts");
             break;
           }
         }
-        // buffer is filled with size bytes at this point (256 allocated but maybe not all used)
+        // buffer is filled with size bytes at this point (BUF_MAX_SIZE allocated but maybe not all used)
 
         SDL_Event event;
         SDL_zero(event); // memset
         event.user.type = read_event_type;
 
-        // data1 points to malloc'ed char* of text read
-        event.user.data1 = buffer;
+        event.user.data1 = buffer.get();
+        decltype(reader_outbound_data.insert(std::move(buffer))) insert_result;
+        {
+          std::lock_guard(reader_outbound_data_lock);
+          insert_result = reader_outbound_data.insert(std::move(buffer));
+        }
+
+        if (!insert_result.second) { // paranoia check. it shouldn't already exist
+          quit = true;
+          perror("mem corrupt on reader send side");
+          break;
+        }
 
         // cast is safe since size will never by negative, and uintptr_t's max is greater than int32 max
         uintptr_t num_bytes = size;
-        // data2 is not a pointer, it encodes the length of bytes used in data1
+        // data2 (the bytes, not what it's pointing to) encodes the length of bytes used in data1
+        static_assert(sizeof(uintptr_t) == sizeof(void*));
         event.user.data2 = reinterpret_cast<void*>(num_bytes);
 
         SDL_PushEvent(&event); // explicitely thread safe. copies event onto queue
       }
     });
 
+    // if quit is set to true by reader thread, this control flow will finish in bounded time
+    SDL_Event event;
     while (!quit) {
-      // handle inputs
-      SDL_Event event;
-
-      while (SDL_WaitEventTimeout(&event, GENERAL_TIMEOUT_MS)) {
-        if (event.type == read_event_type) {
-          struct char_ptr_free {
-            void operator()(char* p) { free(p); } // null check not required
-          };
-          auto data = std::unique_ptr<char, char_ptr_free>(static_cast<char*>(event.user.data1));
-          uintptr_t size = reinterpret_cast<uintptr_t>(event.user.data2);
-
-          // display the data received by the slave
-
-          continue;
-        }
-        switch (event.type) {
-          case SDL_QUIT:
-            quit = true; // signal to reader thread
-            break;
-          case SDL_TEXTINPUT:
-            // send the characters to the slave device
-            puts("yup");
-            // null terminating utf8
-            // event.text.text
-            break;
-          case SDL_KEYDOWN:
-            // event.key
-            break;
-          case SDL_KEYUP:
-            break;
-          default:
-            break;
-        }
+      // loop here waiting for an event
+      if (SDL_WaitEventTimeout(&event, GENERAL_TIMEOUT_MS) != 1) {
+        // ideally error would exit appropriately and only timeout would continue
+        // https://github.com/libsdl-org/SDL/issues/8522
+        continue;
       }
-      // draw
+      // event has been populated
+
+      // handle data received by ptr
+      if (event.type == read_event_type) {
+        void* data_raw = event.user.data1;
+        {
+          std::lock_guard(reader_outbound_data_lock);
+          sizeof(void*);
+          sizeof(UniqMalloc);
+
+          // static_assert(sizeof(void*) == sizeof(UniqMalloc));
+          auto it = reader_outbound_data.find(data_raw);
+
+          insert_result = reader_outbound_data.insert(std::move(buffer));
+        }
+
+        auto data = std::unique_ptr<char, char_ptr_free>(static_cast<char*>(event.user.data1));
+        uintptr_t size = reinterpret_cast<uintptr_t>(event.user.data2);
+
+        // this is the data that was sent to the terminal by the pty
+        // TODO send to display and update graphics
+        continue;
+      }
+
+      // all other events
+      // handle all other events
+      switch (event.type) {
+        case SDL_QUIT:
+          quit = true; // signal to reader thread
+          goto break_outer;
+          break;
+        case SDL_TEXTINPUT:
+          // send the characters to the slave device
+          // non-owned null terminating utf8
+          const char* typed_text = event.text.text;
+          size_t length = strlen(typed_text);
+          while (length != 0 && !quit) {
+            ssize_t bytes_written;
+            {
+              std::lock_guard(master_lock);
+              bytes_written = write(this->master, typed_text, length);
+            }
+            if (bytes_written == -1) {
+              if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(GENERAL_TIMEOUT_MS));
+                continue;
+              }
+              perror("write pts");
+              quit = true;
+              goto break_outer;
+            } else {
+              length -= bytes_written;
+              typed_text += bytes_written;
+            }
+          }
+          break;
+        default:
+          break;
+      }
+
+      // todo don't redraw on each event
       SDL_SetRenderDrawColor(r.get(), 0, 0, 0, 255);
       SDL_RenderClear(r.get());
 
@@ -293,6 +353,7 @@ class PTY {
       SDL_RenderPresent(r.get());
     }
 
+break_outer:
     reader_thread.join();
     return true;
   }
