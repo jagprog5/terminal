@@ -1,13 +1,15 @@
+#include "clocale"
 #include "pty_utils.hpp"
 #include "sdl_utils.hpp"
 
 int main(int argc, const char* const* argv) {
+  std::setlocale(LC_ALL, "");
   std::optional<PTY> maybe_pty = PTY::create();
   if (!maybe_pty) {
     return 1;
   }
-  PTY& pty = *maybe_pty;
 
+  PTY& pty = *maybe_pty;
   if (!pty.spawn()) {
     return 1; 
   }

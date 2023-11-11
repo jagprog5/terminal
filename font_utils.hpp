@@ -16,10 +16,8 @@ int TTFFileExtension(const char* string) {
   return -1;
 }
 
-UNIQUE_PTR_WRAPPER(CharPtr, char, free)
-
 // c string to ttf file, or null (error printed)
-CharPtr get_ttf(const char* pattern) {
+UniqMalloc get_ttf(const char* pattern) {
   if (!FcInit()) {
     fputs("err font-config init\n", stderr);
     return NULL;
@@ -53,9 +51,12 @@ CharPtr get_ttf(const char* pattern) {
         // copy then return file
         size_t length = strlen((char*)file);
         size_t byte_length = (length + 1) * sizeof(char);
-        char* ret = (char*)malloc(byte_length);
+        void* ret = malloc(byte_length);
+        if (!ret) {
+          return NULL;
+        }
         memcpy(ret, file, byte_length);
-        return CharPtr(ret);
+        return UniqMalloc(ret);
       }
     }
   }
@@ -64,6 +65,6 @@ CharPtr get_ttf(const char* pattern) {
   return NULL;
 }
 
-CharPtr get_mono_ttf() {
+UniqMalloc get_mono_ttf() {
   return get_ttf(":mono");
 }

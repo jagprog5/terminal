@@ -80,7 +80,7 @@ class SDLContext {
   }
 
   // null on failure (prints error)
-  FontPtr create_font(const char* ttf_path, int size = 28) const {
+  FontPtr create_font(const char* ttf_path, int size = SINGLE_CHAR_HEIGHT) const {
     FontPtr font = FontPtr(TTF_OpenFont(ttf_path, size));
     if (!font) {
       fprintf(stderr, "err sdl ttf font init: %s\n", TTF_GetError());
@@ -120,12 +120,16 @@ class CharacterManager {
  public:
   // search for a monospace font and use that as the default
   static std::optional<CharacterManager> create(const SDLContext& ctx) {
-    FontPtr mono_font = ctx.create_font(get_mono_ttf().get());
+    UniqMalloc um = get_mono_ttf();
+    if (!um) {
+      return {};
+    }
+    FontPtr mono_font = ctx.create_font((char*)um.get());
     if (!mono_font) {
       return {};
     }
-    CharacterManager lm(std::move(mono_font));
-    return lm;
+    CharacterManager cm(std::move(mono_font));
+    return std::move(cm);
   }
 
   CharacterManager(FontPtr font) : font(std::move(font)) {}
