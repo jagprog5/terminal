@@ -105,7 +105,7 @@ class PTY {
   }
 
   // false on failure (err printed).
-  // doesn't return if this is the slave process.
+  // forks. doesn't return if this is the slave process.
   // returns if this is the master process
   bool spawn() {
     const char* const env[] = {"TERM=xterm-256color", NULL};
@@ -232,12 +232,13 @@ class PTY {
     while (1) {
       bool display_update_required = false;
       SDL_Event event; // ============================ SDL handle event ===============
-      if (SDL_PollEvent(&event)) {
+      // todo add bound to this while loop, n event only before progressing to read / render
+      while (SDL_PollEvent(&event)) {
         if (event.type == SDL_QUIT) {
-          break;
+          goto break_topmost;
         } else if (event.type == SDL_TEXTINPUT) {
           if (!write_txt_to_shell(event.text.text, strlen(event.text.text))) {
-            break; // error already printed
+            goto break_topmost; // error already printed
           }
         } else if (event.type == SDL_KEYDOWN) {
           // text input doesn't work for things like backspace or enter
@@ -254,7 +255,7 @@ class PTY {
 
           if (simple_typed != '\0') {
             if (!write_txt_to_shell(&simple_typed, 1)) {
-              break; // error already printed
+              goto break_topmost; // error already printed
             } 
           }
         } else {
@@ -292,24 +293,25 @@ class PTY {
       }
 
       if (display_update_required) {
-        SDL_RenderClear(renderer.get());
-        unsigned int y = 0;
-        for (const std::vector<UTF8Character>& line : lines) {
-          unsigned int x = 0;
-          for (const UTF8Character& ch : line) {
-            SDL_Texture* texture = character_manager.get(ch, renderer);
-            SDL_Rect dst{(int)x, (int)y, SINGLE_CHAR_WIDTH, SINGLE_CHAR_HEIGHT};
-            SDL_RenderCopy(renderer.get(), texture, NULL, &dst);
-            x += SINGLE_CHAR_WIDTH;
+          SDL_RenderClear(renderer.get());
+          unsigned int y = 0;
+          for (const std::vector<UTF8Character>& line : lines) {
+            unsigned int x = 0;
+            for (const UTF8Character& ch : line) {
+              SDL_Texture* texture = character_manager.get(ch, renderer);
+              SDL_Rect dst{(int)x, (int)y, SINGLE_CHAR_WIDTH, SINGLE_CHAR_HEIGHT};
+              SDL_RenderCopy(renderer.get(), texture, NULL, &dst);
+              x += SINGLE_CHAR_WIDTH;
+            }
+            y += SINGLE_CHAR_HEIGHT;
           }
-          y += SINGLE_CHAR_HEIGHT;
-        }
-        SDL_RenderPresent(renderer.get());
+          SDL_RenderPresent(renderer.get());
       }
 
       // everything in the while loop is non blocking. don't consume entire core
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
+    break_topmost:
     return true;
   }
 };
