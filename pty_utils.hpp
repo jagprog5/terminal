@@ -108,7 +108,7 @@ class PTY {
   // doesn't return if this is the slave process.
   // returns if this is the master process
   bool spawn() {
-    const char* const env[] = {"TERM=" TERM_NAME, NULL};
+    const char* const env[] = {"TERM=xterm-256color", NULL};
 
     pid_t pid = fork();
 
@@ -182,10 +182,10 @@ class PTY {
     }
     CharacterManager& character_manager = *maybe_cm; // texture cache for character rendering
 
-    UTF8DecodeStream decode_stream;
+    UTF8Stream character_stream;
 
     // the lines to display in the terminal
-    std::vector<std::vector<wchar_t>> lines;
+    std::vector<std::vector<UTF8Character>> lines;
     lines.emplace_back(); // lines will never by empty
 
     std::vector<char> master_write_q; // used by write_txt_to_shell
@@ -239,6 +239,24 @@ class PTY {
           if (!write_txt_to_shell(event.text.text, strlen(event.text.text))) {
             break; // error already printed
           }
+        } else if (event.type == SDL_KEYDOWN) {
+          // text input doesn't work for things like backspace or enter
+          char simple_typed = '\0';
+          switch (event.key.keysym.sym) {
+            case SDLK_BACKSPACE:
+              simple_typed = '\b';
+              break;
+            case SDLK_RETURN:
+              simple_typed = '\n';
+            default:
+              break;
+          }
+
+          if (simple_typed != '\0') {
+            if (!write_txt_to_shell(&simple_typed, 1)) {
+              break; // error already printed
+            } 
+          }
         } else {
           // TODO other events like window resize handling
         }
@@ -249,44 +267,48 @@ class PTY {
       if (bytes_read < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
           bytes_read = 0;
+        } else if (errno == EIO) {
+          break; // shell shut down  
         } else {
-          perror("write pts"); // allows negative returned
+          perror("read pts");
           break;
         }
       }
-      std::vector<wchar_t> decoded_chars = decode_stream.get(buffer, bytes_read);
-      if (!decoded_chars.empty()) {
+      std::vector<UTF8Character> chars = character_stream.consume(buffer, bytes_read);
+      if (!chars.empty()) {
         display_update_required = true;
 
-        for (wchar_t wc : decoded_chars) {
-          if (wc == L'\n') {
+        for (UTF8Character& ch : chars) {
+          if (ch.data[0] == '\n') {
             lines.emplace_back();
-          } else if (wc == L'\r') {
+          } else if (ch.data[0] == L'\r') {
             // many todos
-          } else if (wc == L'\0') {
+          } else if (ch.data[0] == L'\0') {
             // do not render
           } else {
-            lines.rbegin()->push_back(wc);
+            lines.rbegin()->push_back(ch);
           }
         }
       }
 
-
       if (display_update_required) {
+        SDL_RenderClear(renderer.get());
         unsigned int y = 0;
-        for (const std::vector<wchar_t>& line : lines) {
-          y += SINGLE_CHAR_HEIGHT;
+        for (const std::vector<UTF8Character>& line : lines) {
           unsigned int x = 0;
-          for (wchar_t wc : line) {
+          for (const UTF8Character& ch : line) {
+            SDL_Texture* texture = character_manager.get(ch, renderer);
+            SDL_Rect dst{(int)x, (int)y, SINGLE_CHAR_WIDTH, SINGLE_CHAR_HEIGHT};
+            SDL_RenderCopy(renderer.get(), texture, NULL, &dst);
             x += SINGLE_CHAR_WIDTH;
-            character_manager.get()
           }
+          y += SINGLE_CHAR_HEIGHT;
         }
-        // renderer
+        SDL_RenderPresent(renderer.get());
       }
 
       // everything in the while loop is non blocking. don't consume entire core
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     return true;
   }
