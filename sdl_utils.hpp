@@ -100,10 +100,10 @@ class SDLContext {
   }
 };
 
-// associates UTF8Character with textures. caches
+// associates UTF8Block with textures. caches
 class CharacterManager {
   FontPtr font;
-  std::unordered_map<UTF8Character, TexturePtr> textures;
+  std::unordered_map<UTF8Block, TexturePtr> textures;
 
  public:
   // search for a monospace font and use that as the default
@@ -124,7 +124,7 @@ class CharacterManager {
 
   // pointer depends on the lifetime of this instance.
   // null on failure (error printed)
-  SDL_Texture* get(UTF8Character utf8_char, const RendererPtr& renderer) {
+  SDL_Texture* get(UTF8Block utf8_char, const RendererPtr& renderer) {
     auto it = textures.find(utf8_char);
     if (it != textures.cend()) {
       // texure has already been renderer
@@ -140,7 +140,7 @@ class CharacterManager {
         wc = *maybe_wc;
       } else {
         // not valid UTF-8. use the character that represents something invalid
-        utf8_char = UTF8Character::invalid_utf8();
+        utf8_char = UTF8Block::invalid_utf8();
         wc = *utf8_char.to_wc();
       }
 
@@ -154,10 +154,11 @@ class CharacterManager {
 
       if (has_glyph == 0) {
         // it's not drawable
-        utf8_char = UTF8Character::no_glyph();
+        utf8_char = UTF8Block::no_glyph();
       }
 
       // create the surface for the character
+      // render with white, since it can be tinted later with SDL_SetTextureColorMod
       auto surface = SurfacePtr(TTF_RenderUTF8_Blended(this->font.get(), //
                                                        utf8_char.data,   //
                                                        SDL_Color{255, 255, 255}));

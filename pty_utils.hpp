@@ -182,11 +182,16 @@ class PTY {
     }
     CharacterManager& character_manager = *maybe_cm; // texture cache for character rendering
 
-    UTF8Stream character_stream;
+    BlockStream block_stream;
 
     // the lines to display in the terminal
-    std::vector<std::vector<UTF8Character>> lines;
+    std::vector<std::vector<Cell>> lines;
     lines.emplace_back(); // lines will never by empty
+
+    CellAttributes cursor_attributes{{255, 255, 255}};
+    int cursor_x = 0; // by pixels
+    int cursor_y = 0;
+    int scroll_y = 0;
 
     std::vector<char> master_write_q; // used by write_txt_to_shell
 
@@ -230,10 +235,9 @@ class PTY {
     };
 
     while (1) {
-      bool display_update_required = false;
       SDL_Event event; // ============================ SDL handle event ===============
-      // todo add bound to this while loop, n event only before progressing to read / render
-      while (SDL_PollEvent(&event)) {
+      unsigned int poll_event_per_iter = 100; // ensure main loop is bounded
+      while (--poll_event_per_iter && SDL_PollEvent(&event)) {
         if (event.type == SDL_QUIT) {
           goto break_topmost;
         } else if (event.type == SDL_TEXTINPUT) {
@@ -262,6 +266,7 @@ class PTY {
           // TODO other events like window resize handling
         }
       }
+      
       static constexpr size_t BUF_MAX_SIZE = 256; // ============= pts read ===========
       char buffer[BUF_MAX_SIZE];
       ssize_t bytes_read = read(master, buffer, BUF_MAX_SIZE);
@@ -275,37 +280,48 @@ class PTY {
           break;
         }
       }
-      std::vector<UTF8Character> chars = character_stream.consume(buffer, bytes_read);
-      if (!chars.empty()) {
-        display_update_required = true;
+      std::vector<Block> blocks = block_stream.consume(buffer, bytes_read);
+      if (!blocks.empty()) {
+        for (const Block& blk : blocks) {
+          if (const UTF8Block* utf8_block = std::get_if<UTF8Block>(&blk)) {
+            if (utf8_block->data[0] == '\n') {
+              cursor_y += SINGLE_CHAR_HEIGHT;
+              lines.emplace_back();
+              if (lines.size() > 127) {
+                lines.erase(lines.begin());
+              }
+            } else if (utf8_block->data[0] == L'\r') {
+              cursor_x = 0;
+            } else if (utf8_block->data[0] == L'\0') {
+              // do not render null char
+            } else {
+              // draw the typed character
+              SDL_Texture* texture = character_manager.get(*utf8_block, renderer);
+              SDL_Rect dst{cursor_x, cursor_y, SINGLE_CHAR_WIDTH, SINGLE_CHAR_HEIGHT};
+              SDL_SetTextureColorMod(texture, cursor_attributes.fg.r, cursor_attributes.fg.g, cursor_attributes.fg.b);
+              SDL_RenderCopy(renderer.get(), texture, NULL, &dst);
+              // TODO more attributes implemented
 
-        for (UTF8Character& ch : chars) {
-          if (ch.data[0] == '\n') {
-            lines.emplace_back();
-          } else if (ch.data[0] == L'\r') {
-            // many todos
-          } else if (ch.data[0] == L'\0') {
-            // do not render
+              cursor_x += SINGLE_CHAR_WIDTH; // move to next position
+              if (cursor_x >= SCREEN_WIDTH) {
+                cursor_x = 0;
+                cursor_y += SINGLE_CHAR_HEIGHT;
+              }
+            }
+          } else if (const ANSIEraseDisplay* erase_display_block = std::get_if<ANSIEraseDisplay>(&blk)) {
+            if (erase_display_block->type == 2) { // entire screen
+              SDL_RenderClear(renderer.get());
+              cursor_x = 0;
+              cursor_y = 0;
+              scroll_y = 0;
+            } else {
+              // TODO
+            }
           } else {
-            lines.rbegin()->push_back(ch);
+            // TODO
           }
         }
-      }
-
-      if (display_update_required) {
-          SDL_RenderClear(renderer.get());
-          unsigned int y = 0;
-          for (const std::vector<UTF8Character>& line : lines) {
-            unsigned int x = 0;
-            for (const UTF8Character& ch : line) {
-              SDL_Texture* texture = character_manager.get(ch, renderer);
-              SDL_Rect dst{(int)x, (int)y, SINGLE_CHAR_WIDTH, SINGLE_CHAR_HEIGHT};
-              SDL_RenderCopy(renderer.get(), texture, NULL, &dst);
-              x += SINGLE_CHAR_WIDTH;
-            }
-            y += SINGLE_CHAR_HEIGHT;
-          }
-          SDL_RenderPresent(renderer.get());
+        SDL_RenderPresent(renderer.get());
       }
 
       // everything in the while loop is non blocking. don't consume entire core
