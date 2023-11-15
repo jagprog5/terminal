@@ -20,7 +20,7 @@
 #include "sdl_utils.hpp"
 #include "string_utils.hpp"
 
-static const char* SHELL = "/bin/dash";
+static const char* SHELL = "/bin/sh";
 
 #define TERM_NAME "not_named_yet"
 
@@ -183,7 +183,7 @@ class PTY {
     std::vector<std::vector<Cell>> lines;
     lines.emplace_back(); // lines will never by empty
 
-    CellAttributes cursor_attributes{{255, 255, 255}};
+    CellAttributes cursor_attributes;
     // position of where text received from the shell will be drawn next
     int cursor_x = 0; // pixels (right from left of screen)
     int cursor_y = 0; // pixels (down from top of screen)
@@ -194,6 +194,11 @@ class PTY {
     // lines[start_line][start_cell] is where drawing starts at the top left of the screen
     int start_line = 0;
     int start_cell = 0;
+
+    // this is the position in lines where text is currently inserted. unlike cursor position,
+    // it is not effected by screen wrapping
+    int insert_line_pos = 0;
+    int insert_cell_pos = 0;
 
     std::vector<char> master_write_q; // used by write_txt_to_shell
 
@@ -234,6 +239,17 @@ class PTY {
         master_write_q.erase(master_write_q.begin(), master_write_q.begin() + bytes_written);
       }
       return true;
+    };
+
+    auto render_cell = [&](int x, int y, const Cell& cell) {
+      SDL_Texture* texture = cell.texture;
+      SDL_Rect dst{x, y, CELL_WIDTH, CELL_HEIGHT};
+      // background
+      SDL_SetRenderDrawColor(renderer.get(), cell.attributes.bg.r, cell.attributes.bg.g, cell.attributes.bg.b, 255);
+      SDL_RenderFillRect(renderer.get(), &dst);
+      // foreground
+      SDL_SetTextureColorMod(texture, cell.attributes.fg.r, cell.attributes.fg.g, cell.attributes.fg.b);
+      SDL_RenderCopy(renderer.get(), texture, NULL, &dst);
     };
 
     while (1) { // main loop
@@ -312,12 +328,7 @@ class PTY {
             const std::vector<Cell>& line = lines[line_index];
             assert(start_cell >= 0);
             for (int cell_index = line_index == start_line ? start_cell : 0; cell_index < line.size(); ++cell_index) {
-              const Cell& cell = line[cell_index];
-              SDL_Texture* texture = cell.texture;
-              SDL_Rect dst{redraw_cursor_x, redraw_cursor_y, CELL_WIDTH, CELL_HEIGHT};
-              SDL_SetTextureColorMod(texture, cell.attributes.fg.r, cell.attributes.fg.g, cell.attributes.fg.b);
-              SDL_RenderCopy(renderer.get(), texture, NULL, &dst);
-
+              render_cell(redraw_cursor_x, redraw_cursor_y, line[cell_index]);
               redraw_cursor_x += CELL_WIDTH;
               if (redraw_cursor_x >= SCREEN_WIDTH) {
                 redraw_cursor_x = 0;
@@ -335,7 +346,7 @@ class PTY {
             break;
           }
         }
-        break_full_redraw:
+break_full_redraw:
         SDL_RenderPresent(renderer.get());
       }
 
@@ -356,52 +367,106 @@ class PTY {
       std::vector<Block> blocks = block_stream.consume(buffer, bytes_read);
 
       // helper lambda
-      auto insert_cell = [&](SDL_Texture* texture, CellAttributes attributes) {
-        SDL_Rect dst{cursor_x, cursor_y, CELL_WIDTH, CELL_HEIGHT};
-        SDL_SetTextureColorMod(texture, attributes.fg.r, attributes.fg.g, attributes.fg.b);
-        SDL_RenderCopy(renderer.get(), texture, NULL, &dst);
-
-        lines.rbegin()->push_back(Cell{texture, attributes});
+      auto insert_cell = [&](Cell cell) {
+        render_cell(cursor_x, cursor_y, cell);
         cursor_x += CELL_WIDTH; // move to next position
         if (cursor_x >= SCREEN_WIDTH) {
           cursor_x = 0;
           cursor_y += CELL_HEIGHT;
         }
+
+        assert(insert_line_pos >= 0 && insert_line_pos < lines.size());
+        while (insert_cell_pos >= lines[insert_line_pos].size()) {
+          // insert a default space until we reach the position in this line
+          lines[insert_line_pos].push_back({character_manager.get(UTF8Block::space(), renderer), CellAttributes()});
+        }
+
+        assert(insert_cell_pos >= 0 && insert_cell_pos < lines[insert_line_pos].size());
+        lines[insert_line_pos][insert_cell_pos] = cell; // replace
+        insert_cell_pos += 1;
       };
 
       if (!blocks.empty()) {
         for (const Block& blk : blocks) {
+          // helper lambda
+          auto move_down = [&](){
+            cursor_y += CELL_HEIGHT;
+            insert_cell_pos += CELLS_PER_WIDTH;
+            assert(insert_line_pos >= 0 && insert_line_pos <= lines.size());
+            if (insert_cell_pos >= lines[insert_line_pos].size()) {
+              insert_line_pos += 1;
+              if (lines.size() == insert_line_pos) {
+                lines.emplace_back();
+              }
+              if (CELLS_PER_WIDTH == 0) {
+                insert_cell_pos = 0;
+              } else {
+                insert_cell_pos = insert_cell_pos - (insert_cell_pos / CELLS_PER_WIDTH) * CELLS_PER_WIDTH;
+              }
+            }
+          };
+
           if (const UTF8Block* utf8_block = std::get_if<UTF8Block>(&blk)) {
             if (utf8_block->data[0] == '\n') {
-              cursor_y += CELL_HEIGHT;
-              lines.emplace_back();
-            } else if (utf8_block->data[0] == L'\r') {
-              cursor_x = 0;
-            } else if (utf8_block->data[0] == L'\t') {
-              // todo fix
-              insert_cell(character_manager.get(UTF8Block::space(), renderer), cursor_attributes);
-              while ((cursor_x / CELL_WIDTH) % 8 != 0) {
-                insert_cell(character_manager.get(UTF8Block::space(), renderer), cursor_attributes);
+              move_down();
+            } else if (utf8_block->data[0] == '\a') {
+              // no beep implemented
+            } else if (utf8_block->data[0] == '\b') {
+              cursor_x -= CELL_WIDTH;
+              if (cursor_x < 0) {
+                cursor_x = CELL_WIDTH * (CELLS_PER_WIDTH - 1);
+                cursor_y -= CELL_HEIGHT;
+                if (cursor_y < 0) {
+                  cursor_x = 0;
+                  cursor_y = 0;
+                }
               }
-            } else if (utf8_block->data[0] == L'\0') {
-              // do not render null char
+              insert_cell_pos -= 1;
+              if (insert_cell_pos < 0) {
+                insert_line_pos -= 1;
+                if (insert_line_pos < 0) {
+                  insert_cell_pos = 0;
+                  insert_line_pos = 0;
+                }
+              }
+            } else if (utf8_block->data[0] == '\r') {
+              cursor_x = 0;
+              insert_cell_pos = (insert_cell_pos / CELLS_PER_WIDTH) * CELLS_PER_WIDTH;
+            } else if (utf8_block->data[0] == '\t') {
+              insert_cell({character_manager.get(UTF8Block::space(), renderer), cursor_attributes});
+              while ((cursor_x / CELL_WIDTH) % 8 != 0) {
+                insert_cell({character_manager.get(UTF8Block::space(), renderer), cursor_attributes});
+              }
+            } else if (utf8_block->data[0] == '\0') {
+              // ignore
             } else {
-              insert_cell(character_manager.get(*utf8_block, renderer), cursor_attributes);
+              insert_cell({character_manager.get(*utf8_block, renderer), cursor_attributes});
+            }
+          } else if (const ANSICursorDown* cursor_down = std::get_if<ANSICursorDown>(&blk)) {
+            for (decltype(cursor_down->n) i = 0; i < cursor_down->n; ++i) {
+              move_down();
             }
           } else if (const ANSIGraphicsForeground* graphics_foreground_block = std::get_if<ANSIGraphicsForeground>(&blk)) {
             cursor_attributes.fg = graphics_foreground_block->c;
+          } else if (const ANSIGraphicsBackground* graphics_background_block = std::get_if<ANSIGraphicsBackground>(&blk)) {
+            cursor_attributes.bg = graphics_background_block->c;
           } else if (const ANSIEraseDisplay* erase_display_block = std::get_if<ANSIEraseDisplay>(&blk)) {
             if (erase_display_block->type == 2) { // entire screen
               SDL_RenderClear(renderer.get());
+              cursor_attributes = CellAttributes();
               cursor_x = 0;
               cursor_y = 0;
               start_cell = 0;
               start_line = 0;
+              insert_cell_pos = 0;
+              insert_line_pos = 0;
               lines.clear();
               lines.emplace_back();
             } else {
               // TODO part of screen
             }
+          } else if (const ANSIGraphicsReset* reset_graphics_block = std::get_if<ANSIGraphicsReset>(&blk)) {
+            cursor_attributes = CellAttributes();
           } else {
             // TODO
           }

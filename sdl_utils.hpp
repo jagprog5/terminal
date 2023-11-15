@@ -183,7 +183,8 @@ class CharacterManager {
 };
 
 struct CellAttributes {
-  Color fg, bg;
+  Color fg{255, 255, 255};
+  Color bg;
   bool italic = false;
   bool bold = false;
   bool underline = false;

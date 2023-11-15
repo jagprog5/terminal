@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "color.hpp"
+#include "state_machine.hpp"
 
 template <typename T>
 void append_to_buffer(std::vector<T>& buf, const T* begin, const T* end) {
@@ -44,6 +45,12 @@ struct UTF8Block {
   static UTF8Block space() {
     UTF8Block ret;
     ret.data[0] = ' ';
+    return ret;
+  }
+
+  static UTF8Block debug() {
+    UTF8Block ret;
+    ret.data[0] = 'X';
     return ret;
   }
 
@@ -223,10 +230,13 @@ using Block = std::variant<UTF8Block,                    //
 class BlockStream {
   // this section of members is used when producing an ANSI escape block
   enum ANSIParseState {
-    NONE,
-    ESCAPE_RECEIVED,
+    RESTORE,
+    HANDLE_PRIOR_INCOMPLETE_MULTIBYTE,
+    BLOCK_START,
+    ANSI_BLOCK,
     CSI_RECEIVED,
-  } ansi_parse_state = NONE;
+  } ansi_parse_state = RESTORE;
+
   static constexpr size_t MAX_ARGS = 64; // https://vt100.net/emu/dec_ansi_parser after n (16 in the citation), args are ignored
   size_t ansi_index;                     // index with args. fixed length vector
   uint16_t ansi_args[MAX_ARGS];
@@ -247,22 +257,34 @@ class BlockStream {
   BlockStream() {}
 
   std::vector<Block> consume(const char* data, size_t length) {
-    assert(incomplete[MAX_BYTES_PER_CHARACTER - 1] == '\0'); // always
     std::vector<Block> ret;
 
-    // go to appropriate position of state machine for ansi code parse
+    SM_ENTER_STATE(ansi_parse, RESTORE); // RESTORE is the start state
+
+    // re-enter the previous state of the machine from the last call.
+    // default next state is HANDLE_PRIOR_INCOMPLETE_MULTIBYTE
+    SM_DEFINE_STATE_BEGIN(ansi_parse, RESTORE);
+    ansi_parse_state = RESTORE;
     switch (ansi_parse_state) {
-      case ESCAPE_RECEIVED:
-        goto escape_received_state;
+      default:
+        SM_ENTER_STATE(ansi_parse, HANDLE_PRIOR_INCOMPLETE_MULTIBYTE);
+        break;
+      case BLOCK_START:
+        SM_ENTER_STATE(ansi_parse, BLOCK_START);
+        break;
+      case ANSI_BLOCK:
+        SM_ENTER_STATE(ansi_parse, ANSI_BLOCK);
         break;
       case CSI_RECEIVED:
-        goto csi_received_state;
-        break;
-      default:
-        // ansi code not parsed right now
+        SM_ENTER_STATE(ansi_parse, CSI_RECEIVED);
         break;
     }
+    SM_END_STATE();
 
+    // check if there is a incomplete UTF-8 multibyte left over from the previous call.
+    // if there is, then bytes go to that first. if not, then move on to BLOCK_START
+    SM_DEFINE_STATE_BEGIN(ansi_parse, HANDLE_PRIOR_INCOMPLETE_MULTIBYTE);
+    ansi_parse_state = HANDLE_PRIOR_INCOMPLETE_MULTIBYTE;
     if (bytes_to_complete != 0) { // handle the incomplete multibyte from previous call
       if (bytes_to_complete <= length) {
         // there is enough bytes to complete the incomplete multibyte
@@ -281,24 +303,29 @@ class BlockStream {
         memcpy(incomplete + offset, data, num_to_take);
         offset += num_to_take;
         bytes_to_complete -= num_to_take;
-        return ret; // empty
+        return ret; // ret is empty
       }
     }
+    SM_ENTER_STATE(ansi_parse, BLOCK_START);
+    SM_END_STATE();
 
-next_block:
+    // BLOCK_START checks if there is an escape character,
+    // and goes to ANSI_START if so, or if not it handles a UTF8 block
+    SM_DEFINE_STATE_BEGIN(ansi_parse, BLOCK_START);
+    ansi_parse_state = BLOCK_START;
     if (length == 0) {
+      if (ret.size())
       return ret;
     }
 
     if (*data != '\e') {
-      // this next block is not an ansi escape sequence. handle UTF-8 block
       int bytes_needed = UTF8Block::u8_length(*data);
       if (bytes_needed == -1) {
         ret.push_back(UTF8Block::stray_continuation());
         // progress by a single byte on error length block
         data += 1;
         length -= 1;
-        goto next_block;
+        SM_ENTER_STATE(ansi_parse, BLOCK_START);
       }
 
       if (bytes_needed <= length) {
@@ -308,7 +335,7 @@ next_block:
         ret.push_back(ch);
         data += bytes_needed;
         length -= bytes_needed;
-        goto next_block;
+        SM_ENTER_STATE(ansi_parse, BLOCK_START);
       } else {
         // not enough. place it into incomplete
         for (size_t i = 0; i < length; ++i) {
@@ -318,83 +345,67 @@ next_block:
         offset += length;
         return ret;
       }
-      // <- never reached
-    } // finishes UTf8-block handling
+    } else {
+      data += 1; // '\e' consumed.
+      length -= 1;
+      SM_ENTER_STATE(ansi_parse, ANSI_BLOCK);
+    }
+    SM_END_STATE();
 
-    ansi_parse_state = ESCAPE_RECEIVED;
+    SM_DEFINE_STATE_BEGIN(ansi_parse, ANSI_BLOCK);
+    ansi_parse_state = ANSI_BLOCK;
+    if (length == 0) {
+      return ret;
+    }
+    bool success = *data == '[';
     data += 1;
     length -= 1;
-escape_received_state:
-    if (length == 0) {
-      return ret;
+    if (!success) {
+      // consumes the \e and one following
+      SM_ENTER_STATE(ansi_parse, BLOCK_START);
     }
-    {
-      bool success = *data == '[';
-      data += 1;
-      length -= 1;
-      if (!success) {
-        ansi_parse_state = NONE;
-        goto next_block; // consumes the \e and one following
-      }
-    }
-    ansi_parse_state = CSI_RECEIVED;
     ansi_index = 0;
-    ansi_args[0] = 0; // some commands use 0s as default args.
-    ansi_args[1] = 0; // only clear first and second
-csi_received_state:
+    // some commands use 0s as default args.
+    // only clear first and second. if a function name (letter) is received right away, then that's all it will use
+    ansi_args[0] = 0;
+    ansi_args[1] = 0;
+    SM_ENTER_STATE(ansi_parse, CSI_RECEIVED);
+    SM_END_STATE();
+
+    SM_DEFINE_STATE_BEGIN(ansi_parse, CSI_RECEIVED);
+    ansi_parse_state = CSI_RECEIVED;
     if (length == 0) {
       return ret;
     }
 
-    // handling the args, character by character
-    if (*data >= '0' && *data <= '9') {
-      if (ansi_index != MAX_ARGS) { // ignore if max args exceeded (one past end)
-        ansi_args[ansi_index] *= 10;
-        ansi_args[ansi_index] += *data - '0';
+    char ch = *data;
+    data += 1;
+    length -= 1;
+
+    if (ch == 'h') {
+      ch = '1';
+    }
+
+    if ((ch >= '0' && ch <= '9') || ch == ';') {
+      if (ansi_index < MAX_ARGS) { // ignore if max args exceeded
+        // ansi argument related
+        if (ch == ';') {
+          // argument separator
+          ansi_index += 1;
+          ansi_args[ansi_index] = 0;
+        } else {
+          ansi_args[ansi_index] *= 10;
+          ansi_args[ansi_index] += ch - '0';
+        }
       }
-    } else if (*data == ';') {
-      if (ansi_index != MAX_ARGS) { // don't increment when at one past end
-        ansi_index += 1;
-        ansi_args[ansi_index] = 0;
-      }
-    } else if (*data == 'h') {
-      if (ansi_index != MAX_ARGS) { // ignore if max args exceeded (one past end)
-        ansi_args[ansi_index] *= 10;
-        ansi_args[ansi_index] += 1;
-      }
-    } else if (*data == 'A') {
-      ret.push_back(ANSICursorUp{ansi_args[0]});
-    } else if (*data == 'B') {
-      ret.push_back(ANSICursorDown{ansi_args[0]});
-    } else if (*data == 'C') {
-      ret.push_back(ANSICursorForward{ansi_args[0]});
-    } else if (*data == 'D') {
-      ret.push_back(ANSICursorBack{ansi_args[0]});
-    } else if (*data == 'E') {
-      ret.push_back(ANSICursorNextLine{ansi_args[0]});
-    } else if (*data == 'F') {
-      ret.push_back(ANSICursorPreviousLine{ansi_args[0]});
-    } else if (*data == 'G' || *data == 'f') {
-      ret.push_back(ANSICursorHorizontalAbsolute{ansi_args[0]});
-    } else if (*data == 'H') {
-      ret.push_back(ANSICursorPosition{ansi_args[0], ansi_args[1]});
-    } else if (*data == 'J') {
-      ret.push_back(ANSIEraseDisplay{(unsigned char)ansi_args[0]});
-    } else if (*data == 'K') {
-      ret.push_back(ANSIEraseLine{(unsigned char)ansi_args[0]});
-    } else if (*data == 'S') {
-      ret.push_back(ANSIScrollUp{ansi_args[0]});
-    } else if (*data == 'T') {
-      ret.push_back(ANSIScrollDown{ansi_args[0]});
-    } else if (*data == 's') {
-      ret.push_back(ANSISaveCursor());
-    } else if (*data == 'u') {
-      ret.push_back(ANSILoadCursor());
-    } else if (*data == 'm') {
-      if (ansi_index != MAX_ARGS) {
+      SM_ENTER_STATE(ansi_parse, CSI_RECEIVED);
+    } else if (ch == '\e') {
+      SM_ENTER_STATE(ansi_parse, ANSI_BLOCK);
+    } else if (ch == 'm') {
+      // select graphics rendition
+      if (ansi_index < MAX_ARGS) {
         ++ansi_index;
       }
-      // select graphics rendition
       for (size_t i = 0; i < ansi_index; ++i) {
         if (ansi_args[i] == 0) {
           ret.push_back(ANSIGraphicsReset());
@@ -404,6 +415,8 @@ csi_received_state:
           ret.push_back(ANSIGraphicsItalic());
         } else if (ansi_args[i] >= 30 && ansi_args[i] <= 37) {
           ret.push_back(ANSIGraphicsForeground{Color::from8(ansi_args[i] - 30)});
+        } else if (ansi_args[i] >= 40 && ansi_args[i] <= 47) {
+          ret.push_back(ANSIGraphicsBackground{Color::from8(ansi_args[i] - 40)});
         } else if (ansi_args[i] == 38) {
           if (i + 1 < ansi_index) {
             // next index is valid (check for 2 or 5)
@@ -415,11 +428,9 @@ csi_received_state:
               }
             } else if (ansi_args[i + 1] == 2) {
               // foreground via rgb
-              if (i + 4 < ansi_index) {                    // next, next 3 indices are valid
+              if (i + 4 < ansi_index) { // next, next 3 indices are valid
                 ret.push_back(ANSIGraphicsForeground{Color{//
-                                                           (unsigned char)ansi_args[i + 2],
-                                                           (unsigned char)ansi_args[i + 3],
-                                                           (unsigned char)ansi_args[i + 4]}});
+                                                           (unsigned char)ansi_args[i + 2], (unsigned char)ansi_args[i + 3], (unsigned char)ansi_args[i + 4]}});
               }
             }
           }
@@ -438,9 +449,7 @@ csi_received_state:
               // background via rgb
               if (i + 4 < ansi_index) {                    // next, next 3 indices are valid
                 ret.push_back(ANSIGraphicsBackground{Color{//
-                                                           (unsigned char)ansi_args[i + 2],
-                                                           (unsigned char)ansi_args[i + 3],
-                                                           (unsigned char)ansi_args[i + 4]}});
+                                                           (unsigned char)ansi_args[i + 2], (unsigned char)ansi_args[i + 3], (unsigned char)ansi_args[i + 4]}});
               }
             }
           }
@@ -453,19 +462,38 @@ csi_received_state:
           break;
         }
       }
-    } else if (*data == '\e') {
-      ansi_parse_state = ESCAPE_RECEIVED;
-      data += 1;
-      length -= 1;
-      goto escape_received_state;
     } else {
-      ansi_parse_state = NONE;
-      data += 1;
-      length -= 1;
-      goto next_block;
+      if (ch == 'A') {
+        ret.push_back(ANSICursorUp{ansi_args[0]});
+      } else if (ch == 'B') {
+        ret.push_back(ANSICursorDown{ansi_args[0]});
+      } else if (ch == 'C') {
+        ret.push_back(ANSICursorForward{ansi_args[0]});
+      } else if (ch == 'D') {
+        ret.push_back(ANSICursorBack{ansi_args[0]});
+      } else if (ch == 'E') {
+        ret.push_back(ANSICursorNextLine{ansi_args[0]});
+      } else if (ch == 'F') {
+        ret.push_back(ANSICursorPreviousLine{ansi_args[0]});
+      } else if (ch == 'G' || ch == 'f') {
+        ret.push_back(ANSICursorHorizontalAbsolute{ansi_args[0]});
+      } else if (ch == 'H') {
+        ret.push_back(ANSICursorPosition{ansi_args[0], ansi_args[1]});
+      } else if (ch == 'J') {
+        ret.push_back(ANSIEraseDisplay{(unsigned char)ansi_args[0]});
+      } else if (ch == 'K') {
+        ret.push_back(ANSIEraseLine{(unsigned char)ansi_args[0]});
+      } else if (ch == 'S') {
+        ret.push_back(ANSIScrollUp{ansi_args[0]});
+      } else if (ch == 'T') {
+        ret.push_back(ANSIScrollDown{ansi_args[0]});
+      } else if (ch == 's') {
+        ret.push_back(ANSISaveCursor());
+      } else if (ch == 'u') {
+        ret.push_back(ANSILoadCursor());
+      }
     }
-    data += 1;
-    length -= 1;
-    goto csi_received_state; // next character
+    SM_ENTER_STATE(ansi_parse, BLOCK_START);
+    SM_END_STATE();
   }
 };
