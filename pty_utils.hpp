@@ -17,8 +17,8 @@
 
 #include <thread>
 
-#include "string_utils.hpp"
 #include "sdl_utils.hpp"
+#include "string_utils.hpp"
 
 static const char* SHELL = "/bin/dash";
 
@@ -130,19 +130,14 @@ class PTY {
       // and the controlling terminal
       int ret = ioctl(this->slave, TIOCSCTTY, NULL);
       if (ret == -1) {
-        if (errno == EIO) {
-          // if master fd's handles have been closed (from master process
-          // exiting already, which can happen if it exits fast enough), ioctl
-          // results in EIO
-          perror("pty controller has already exited while setting up controllee. ioctl(TIOCSCTTY)");
-        } else {
-          perror("err ioctl(TIOCSCTTY)");
-        }
+        // if master fd's handles have been closed (from master process
+        // exiting already, which can happen if it exits fast enough), ioctl
+        // results in EIO
+        perror("err ioctl(TIOCSCTTY)");
         return false;
       }
 
-      // setup my streams to be the same as the pts,
-      // and replace me with the shell
+      // setup my streams to be the same as the pts
       for (int i = 0; i < 3; ++i) {
         if (dup2(this->slave, i) == -1) {
           perror("dup2");
@@ -152,7 +147,7 @@ class PTY {
 
       this->slave.close();
 
-      // replace this process with shell.
+      // replace me with the shell
       execle(SHELL, SHELL, NULL, env);
       // never reached normally
       perror("err exec");
@@ -189,9 +184,16 @@ class PTY {
     lines.emplace_back(); // lines will never by empty
 
     CellAttributes cursor_attributes{{255, 255, 255}};
-    int cursor_x = 0; // by pixels
-    int cursor_y = 0;
-    int scroll_y = 0;
+    // position of where text received from the shell will be drawn
+    int cursor_x = 0; // pixels (right from left of screen)
+    int cursor_y = 0; // pixels (down from top of screen)
+
+    // position in lines for when the entire screen is redrawn
+    // terminology is confusing. a "line" (std::vector<Cell>) is broken by newline chars received by the shell.
+    // however, the line itself is broken up into lines visually when text wrapping occurs.
+    // lines[start_line][start_cell] is where drawing starts at the top left of the screen
+    int start_line = 0;
+    int start_cell = 0;
 
     std::vector<char> master_write_q; // used by write_txt_to_shell
 
@@ -199,14 +201,14 @@ class PTY {
     // than looping until it's finished writing, it gets put on a queue which is
     // written first on subsequent calls. this ensures calling has bounded time
     auto write_txt_to_shell = [&](const char* text, size_t length) -> bool {
-      // returns negative value on error
+      // returns negative value on error (error printed)
       auto do_write = [&](const char* text, size_t length) -> ssize_t {
         ssize_t bytes_written = write(this->master, text, length);
         if (bytes_written < 0) {
           if (errno == EAGAIN || errno == EWOULDBLOCK) {
             bytes_written = 0; // no bytes written
           } else {
-            perror("write pts"); // allows negative returned
+            perror("write pts"); // negative return handled by callee
           }
         }
         return bytes_written;
@@ -234,8 +236,9 @@ class PTY {
       return true;
     };
 
-    while (1) {
-      SDL_Event event; // ============================ SDL handle event ===============
+    while (1) { // main loop
+      bool full_redraw_required = false;
+      SDL_Event event;                        // ============================ SDL handle event ===============
       unsigned int poll_event_per_iter = 100; // ensure main loop is bounded
       while (--poll_event_per_iter && SDL_PollEvent(&event)) {
         if (event.type == SDL_QUIT) {
@@ -245,7 +248,7 @@ class PTY {
             goto break_topmost; // error already printed
           }
         } else if (event.type == SDL_KEYDOWN) {
-          // text input doesn't work for things like backspace or enter
+          // text input is for text only. it doesn't work for things like backspace or enter
           char simple_typed = '\0';
           switch (event.key.keysym.sym) {
             case SDLK_BACKSPACE:
@@ -260,13 +263,82 @@ class PTY {
           if (simple_typed != '\0') {
             if (!write_txt_to_shell(&simple_typed, 1)) {
               goto break_topmost; // error already printed
-            } 
+            }
           }
+        } else if (event.type == SDL_MOUSEWHEEL) {
+          // assuming each character spans 1 cell. not true in reality, but this is ignored
+          if (event.wheel.y < 0) { // scroll down
+            for (int i = 0; i < -event.wheel.y; ++i) {
+              start_cell += CELLS_PER_WIDTH;
+              cursor_y -= CELL_HEIGHT;
+              if (start_line < 0 || start_line >= lines.size() || start_cell >= lines[start_line].size()) {
+                start_line += 1;
+                start_cell = 0;
+              }
+            }
+          } else { // scroll up
+            // negative scroll is scroll up
+            for (int i = 0; i < event.wheel.y; ++i) {
+              start_cell -= CELLS_PER_WIDTH;
+              cursor_y += CELL_HEIGHT;
+              if (start_cell < 0) {
+                start_line -= 1;
+                if (start_line < 0 || start_line >= lines.size()) {
+                  start_cell = 0;
+                } else {
+                  if (CELLS_PER_WIDTH == 0) {
+                    start_cell = 0;
+                  } else {
+                    start_cell = (lines[start_line].size() / CELLS_PER_WIDTH) * CELLS_PER_WIDTH;
+                  }
+                }
+              }
+            }
+          }
+          full_redraw_required = true;
         } else {
           // TODO other events like window resize handling
         }
       }
-      
+
+      if (full_redraw_required) {
+        SDL_RenderClear(renderer.get());
+        int redraw_cursor_x = 0; // pixels
+        int redraw_cursor_y = 0;
+
+        int line_index = start_line;
+        while (1) {
+          if (line_index >= 0 && line_index < lines.size()) {
+            const std::vector<Cell>& line = lines[line_index];
+            assert(start_cell >= 0);
+            for (int cell_index = line_index == start_line ? start_cell : 0; cell_index < line.size(); ++cell_index) {
+              const Cell& cell = line[cell_index];
+              SDL_Texture* texture = cell.texture;
+              SDL_Rect dst{redraw_cursor_x, redraw_cursor_y, CELL_WIDTH, CELL_HEIGHT};
+              SDL_SetTextureColorMod(texture, cell.attributes.fg.r, cell.attributes.fg.g, cell.attributes.fg.b);
+              SDL_RenderCopy(renderer.get(), texture, NULL, &dst);
+
+              redraw_cursor_x += CELL_WIDTH;
+              if (redraw_cursor_x >= SCREEN_WIDTH) {
+                redraw_cursor_x = 0;
+                redraw_cursor_y += CELL_HEIGHT;
+                if (redraw_cursor_y >= SCREEN_HEIGHT) {
+                  goto break_full_redraw;
+                }
+              }
+            }
+          }
+          ++line_index;
+          redraw_cursor_y += CELL_HEIGHT;
+          redraw_cursor_x = 0;
+          if (redraw_cursor_y >= SCREEN_HEIGHT) {
+            break;
+          }
+        }
+        break_full_redraw:
+        SDL_RenderPresent(renderer.get());
+      }
+
       static constexpr size_t BUF_MAX_SIZE = 256; // ============= pts read ===========
       char buffer[BUF_MAX_SIZE];
       ssize_t bytes_read = read(master, buffer, BUF_MAX_SIZE);
@@ -274,7 +346,7 @@ class PTY {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
           bytes_read = 0;
         } else if (errno == EIO) {
-          break; // shell shut down  
+          break; // shell shut down
         } else {
           perror("read pts");
           break;
@@ -285,27 +357,25 @@ class PTY {
         for (const Block& blk : blocks) {
           if (const UTF8Block* utf8_block = std::get_if<UTF8Block>(&blk)) {
             if (utf8_block->data[0] == '\n') {
-              cursor_y += SINGLE_CHAR_HEIGHT;
+              cursor_y += CELL_HEIGHT;
               lines.emplace_back();
-              if (lines.size() > 127) {
-                lines.erase(lines.begin());
-              }
             } else if (utf8_block->data[0] == L'\r') {
               cursor_x = 0;
             } else if (utf8_block->data[0] == L'\0') {
               // do not render null char
             } else {
-              // draw the typed character
+              // draw the character received from the shell
               SDL_Texture* texture = character_manager.get(*utf8_block, renderer);
-              SDL_Rect dst{cursor_x, cursor_y, SINGLE_CHAR_WIDTH, SINGLE_CHAR_HEIGHT};
+              SDL_Rect dst{cursor_x, cursor_y, CELL_WIDTH, CELL_HEIGHT};
               SDL_SetTextureColorMod(texture, cursor_attributes.fg.r, cursor_attributes.fg.g, cursor_attributes.fg.b);
               SDL_RenderCopy(renderer.get(), texture, NULL, &dst);
-              // TODO more attributes implemented
 
-              cursor_x += SINGLE_CHAR_WIDTH; // move to next position
+              lines.rbegin()->push_back(Cell{texture, cursor_attributes});
+
+              cursor_x += CELL_WIDTH; // move to next position
               if (cursor_x >= SCREEN_WIDTH) {
                 cursor_x = 0;
-                cursor_y += SINGLE_CHAR_HEIGHT;
+                cursor_y += CELL_HEIGHT;
               }
             }
           } else if (const ANSIEraseDisplay* erase_display_block = std::get_if<ANSIEraseDisplay>(&blk)) {
@@ -313,9 +383,12 @@ class PTY {
               SDL_RenderClear(renderer.get());
               cursor_x = 0;
               cursor_y = 0;
-              scroll_y = 0;
+              start_cell = 0;
+              start_line = 0;
+              lines.clear();
+              lines.emplace_back();
             } else {
-              // TODO
+              // TODO part of screen
             }
           } else {
             // TODO
@@ -327,7 +400,7 @@ class PTY {
       // everything in the while loop is non blocking. don't consume entire core
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
-    break_topmost:
+break_topmost:
     return true;
   }
 };

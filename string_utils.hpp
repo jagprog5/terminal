@@ -241,6 +241,7 @@ class BlockStream {
   BlockStream() {}
 
   std::vector<Block> consume(const char* data, size_t length) {
+    assert(incomplete[MAX_BYTES_PER_CHARACTER - 1] == '\0'); // always
     std::vector<Block> ret;
 
     // go to appropriate position of state machine for ansi code parse
@@ -402,8 +403,6 @@ csi_received_state:
               if (i + 2 < ansi_index) {
                 // next next index is valid
                 ret.push_back(ANSIGraphicsForeground{Color::from256(ansi_args[i + 2])});
-              } else {
-                break;
               }
             } else if (ansi_args[i + 1] == 2) {
               // foreground via rgb
@@ -412,13 +411,10 @@ csi_received_state:
                                                            (unsigned char)ansi_args[i + 2],
                                                            (unsigned char)ansi_args[i + 3],
                                                            (unsigned char)ansi_args[i + 4]}});
-              } else {
-                break;
               }
             }
-          } else {
-            // would normally break anyways since this is last index
           }
+          break;
         } else if (ansi_args[i] == 48) {
           // copy paste of above but background instead of foreground
           if (i + 1 < ansi_index) {
@@ -428,8 +424,6 @@ csi_received_state:
               if (i + 2 < ansi_index) {
                 // next next index is valid
                 ret.push_back(ANSIGraphicsBackground{Color::from256(ansi_args[i + 2])});
-              } else {
-                break;
               }
             } else if (ansi_args[i + 1] == 2) {
               // background via rgb
@@ -438,19 +432,16 @@ csi_received_state:
                                                            (unsigned char)ansi_args[i + 2],
                                                            (unsigned char)ansi_args[i + 3],
                                                            (unsigned char)ansi_args[i + 4]}});
-              } else {
-                break;
               }
             }
-          } else {
-            // would normally break anyways since this is last index
           }
+          break;
         } else if (ansi_args[i] >= 90 && ansi_args[i] <= 97) {
           ret.push_back(ANSIGraphicsForeground{Color::from8bright(ansi_args[i] - 90)});
         } else if (ansi_args[i] >= 100 && ansi_args[i] <= 107) {
           ret.push_back(ANSIGraphicsBackground{Color::from8bright(ansi_args[i] - 100)});
         } else {
-          // unknown. ignore, continue
+          break;
         }
       }
     } else if (*data == '\e') {
@@ -468,16 +459,4 @@ csi_received_state:
     length -= 1;
     goto csi_received_state; // next character
   }
-};
-
-struct CellAttributes {
-  Color fg, bg;
-  bool italic = false;
-  bool bold = false;
-  bool underline = false;
-};
-
-struct Cell {
-  UTF8Block blk;
-  CellAttributes attributes;
 };

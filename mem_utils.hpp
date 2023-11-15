@@ -21,7 +21,6 @@ struct scope_exit {
 template <class F>
 scope_exit(F) -> scope_exit<F>;
 
-
 struct destroyer_for_malloc {
   void operator()(void* p) { free(p); } // explicitly no null check
 };

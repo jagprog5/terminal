@@ -10,11 +10,13 @@
 #include "mem_utils.hpp"
 #include "string_utils.hpp"
 
-static constexpr unsigned int SINGLE_CHAR_WIDTH = 8;
-static constexpr unsigned int SINGLE_CHAR_HEIGHT = 16;
-static constexpr unsigned int SCREEN_WIDTH = SINGLE_CHAR_WIDTH * 80;
+static constexpr unsigned int CELL_WIDTH = 8;
+static constexpr unsigned int CELL_HEIGHT = 16;
+static constexpr unsigned int CELLS_PER_WIDTH = 80;
+static constexpr unsigned int CELLS_PER_HEIGHT = 24;
+static constexpr unsigned int SCREEN_WIDTH = CELL_WIDTH * CELLS_PER_WIDTH;
+static constexpr unsigned int SCREEN_HEIGHT = CELL_HEIGHT * CELLS_PER_HEIGHT;
 static constexpr unsigned int FONT_RESOLUTION = 32;
-static constexpr unsigned int SCREEN_HEIGHT = SINGLE_CHAR_HEIGHT * 24;
 
 UNIQUE_PTR_WRAPPER(WindowPtr, SDL_Window, SDL_DestroyWindow)
 UNIQUE_PTR_WRAPPER(FontPtr, TTF_Font, TTF_CloseFont)
@@ -24,7 +26,7 @@ UNIQUE_PTR_WRAPPER(TexturePtr, SDL_Texture, SDL_DestroyTexture)
 
 // null for failure: error reason printed
 RendererPtr create_renderer(const WindowPtr& w) {
-  // wsl nividia driver issue for valgrind:
+  // wsl nividia driver issue for valgrind (causes segfault):
   // export LIBGL_ALWAYS_SOFTWARE=true
   RendererPtr ret(SDL_CreateRenderer(w.get(), -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC));
   if (!ret) {
@@ -144,7 +146,7 @@ class CharacterManager {
         wc = *utf8_char.to_wc();
       }
 
-      // give the character in wide char form, is it drawable?
+      // given the character in wide char form, is it drawable?
       int has_glyph;
       if (sizeof(wchar_t) == 2) {
         has_glyph = TTF_GlyphIsProvided(this->font.get(), wc);
@@ -178,4 +180,16 @@ class CharacterManager {
       return inserted_it->second.get();
     }
   }
+};
+
+struct CellAttributes {
+  Color fg, bg;
+  bool italic = false;
+  bool bold = false;
+  bool underline = false;
+};
+
+struct Cell {
+  SDL_Texture* texture;
+  CellAttributes attributes;
 };
