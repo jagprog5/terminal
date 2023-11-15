@@ -41,6 +41,12 @@ struct UTF8Block {
     }
   }
 
+  static UTF8Block space() {
+    UTF8Block ret;
+    ret.data[0] = ' ';
+    return ret;
+  }
+
   static UTF8Block stray_continuation() {
     UTF8Block ret; // https://www.fileformat.info/info/unicode/char/fffd/index.htm
     ret.data[0] = 0xEF;
@@ -353,8 +359,8 @@ csi_received_state:
       }
     } else if (*data == 'h') {
       if (ansi_index != MAX_ARGS) { // ignore if max args exceeded (one past end)
-        ansi_args[ansi_index - 1] *= 10;
-        ansi_args[ansi_index - 1] += 1;
+        ansi_args[ansi_index] *= 10;
+        ansi_args[ansi_index] += 1;
       }
     } else if (*data == 'A') {
       ret.push_back(ANSICursorUp{ansi_args[0]});
@@ -385,6 +391,9 @@ csi_received_state:
     } else if (*data == 'u') {
       ret.push_back(ANSILoadCursor());
     } else if (*data == 'm') {
+      if (ansi_index != MAX_ARGS) {
+        ++ansi_index;
+      }
       // select graphics rendition
       for (size_t i = 0; i < ansi_index; ++i) {
         if (ansi_args[i] == 0) {

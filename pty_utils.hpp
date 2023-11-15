@@ -184,7 +184,7 @@ class PTY {
     lines.emplace_back(); // lines will never by empty
 
     CellAttributes cursor_attributes{{255, 255, 255}};
-    // position of where text received from the shell will be drawn
+    // position of where text received from the shell will be drawn next
     int cursor_x = 0; // pixels (right from left of screen)
     int cursor_y = 0; // pixels (down from top of screen)
 
@@ -352,7 +352,23 @@ class PTY {
           break;
         }
       }
+
       std::vector<Block> blocks = block_stream.consume(buffer, bytes_read);
+
+      // helper lambda
+      auto insert_cell = [&](SDL_Texture* texture, CellAttributes attributes) {
+        SDL_Rect dst{cursor_x, cursor_y, CELL_WIDTH, CELL_HEIGHT};
+        SDL_SetTextureColorMod(texture, attributes.fg.r, attributes.fg.g, attributes.fg.b);
+        SDL_RenderCopy(renderer.get(), texture, NULL, &dst);
+
+        lines.rbegin()->push_back(Cell{texture, attributes});
+        cursor_x += CELL_WIDTH; // move to next position
+        if (cursor_x >= SCREEN_WIDTH) {
+          cursor_x = 0;
+          cursor_y += CELL_HEIGHT;
+        }
+      };
+
       if (!blocks.empty()) {
         for (const Block& blk : blocks) {
           if (const UTF8Block* utf8_block = std::get_if<UTF8Block>(&blk)) {
@@ -361,23 +377,19 @@ class PTY {
               lines.emplace_back();
             } else if (utf8_block->data[0] == L'\r') {
               cursor_x = 0;
+            } else if (utf8_block->data[0] == L'\t') {
+              // todo fix
+              insert_cell(character_manager.get(UTF8Block::space(), renderer), cursor_attributes);
+              while ((cursor_x / CELL_WIDTH) % 8 != 0) {
+                insert_cell(character_manager.get(UTF8Block::space(), renderer), cursor_attributes);
+              }
             } else if (utf8_block->data[0] == L'\0') {
               // do not render null char
             } else {
-              // draw the character received from the shell
-              SDL_Texture* texture = character_manager.get(*utf8_block, renderer);
-              SDL_Rect dst{cursor_x, cursor_y, CELL_WIDTH, CELL_HEIGHT};
-              SDL_SetTextureColorMod(texture, cursor_attributes.fg.r, cursor_attributes.fg.g, cursor_attributes.fg.b);
-              SDL_RenderCopy(renderer.get(), texture, NULL, &dst);
-
-              lines.rbegin()->push_back(Cell{texture, cursor_attributes});
-
-              cursor_x += CELL_WIDTH; // move to next position
-              if (cursor_x >= SCREEN_WIDTH) {
-                cursor_x = 0;
-                cursor_y += CELL_HEIGHT;
-              }
+              insert_cell(character_manager.get(*utf8_block, renderer), cursor_attributes);
             }
+          } else if (const ANSIGraphicsForeground* graphics_foreground_block = std::get_if<ANSIGraphicsForeground>(&blk)) {
+            cursor_attributes.fg = graphics_foreground_block->c;
           } else if (const ANSIEraseDisplay* erase_display_block = std::get_if<ANSIEraseDisplay>(&blk)) {
             if (erase_display_block->type == 2) { // entire screen
               SDL_RenderClear(renderer.get());
